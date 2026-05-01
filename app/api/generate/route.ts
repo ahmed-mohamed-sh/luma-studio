@@ -6,19 +6,36 @@ import {
 import { getMonthlyGenerationLimit } from "@/lib/generation-quota";
 import { auth } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
-import sharp from "sharp";
+import { HfInference } from "@huggingface/inference";
 
 import * as Sentry from "@sentry/nextjs";
-import { openaiProvider } from "@/lib/GoogleGemini";
+import { geminiClient } from "@/lib/GoogleGemini";
 import { ACCEPTED_SOURCE_IMAGE_MIME_TYPES } from "@/lib/constants";
 import { getStylePreset } from "@/lib/style-presets";
 
-import { APICallError, generateImage, NoImageGeneratedError } from "ai";
 import { uploadBufferToImageKit } from "@/lib/imagekit";
 
 export const runtime = "nodejs";
 
-type EditImageSize = "1024x1024" | "1536x1024" | "1024x1536";
+async function withRetry<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
+  let attempt = 0;
+  while (attempt < retries) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      if (err?.status === 503 || err?.error?.code === 503) {
+        attempt++;
+        if (attempt >= retries) throw err;
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error("Unreachable");
+}
+
+
 
 type GenerateImageRequest = {
   sourceImageUrl?: string;
@@ -28,27 +45,7 @@ type GenerateImageRequest = {
   model?: string;
 };
 
-/**
- * inferImageSize reads width and height from the uploaded image (via sharp), computes aspect ratio,
- * and returns one of the allowed `size` values for OpenAI image edits.
- */
-async function inferImageSize(imageBuffer: Buffer): Promise<EditImageSize> {
-  try {
-    const metadata = await sharp(imageBuffer).metadata();
 
-    if (!metadata.width || !metadata.height) {
-      return "1024x1024";
-    }
-
-    const aspectRatio = metadata.width / metadata.height;
-
-    if (aspectRatio > 1.08) return "1536x1024"; // this means that the input image is wider than it is tall
-    if (aspectRatio < 0.92) return "1024x1536"; // this means that the input image is taller than it is wide
-    return "1024x1024"; // this means that the input image is square
-  } catch {
-    return "1024x1024";
-  }
-}
 
 export async function POST(request: Request) {
   const { userId, has } = await auth();
@@ -77,9 +74,16 @@ export async function POST(request: Request) {
     );
   }
 
-  if (!openaiProvider) {
+  if (!geminiClient) {
     return NextResponse.json(
-      { error: "Missing OPENAI_API_KEY." },
+      { error: "Missing GEMINI_API_KEY." },
+      { status: 500 },
+    );
+  }
+
+  if (!process.env.HF_TOKEN) {
+    return NextResponse.json(
+      { error: "Missing HF_TOKEN in environment variables." },
       { status: 500 },
     );
   }
@@ -137,7 +141,6 @@ export async function POST(request: Request) {
   }
 
   const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-  const imageSize = await inferImageSize(imageBuffer);
 
   const prompt = [
     preset.prompt,
@@ -161,35 +164,41 @@ export async function POST(request: Request) {
         },
       },
       async (span) => {
-        const out = await generateImage({
-          model: openaiProvider!.imageModel(model),
-          prompt: {
-            images: [imageBuffer],
-            text: prompt,
-          },
-          size: imageSize,
-          providerOptions: {
-            openai: {
-              input_fidelity: "high", // this means that the input image is used as a reference for the generation,
-              quality: "medium", // this means that the output image is of medium quality
-              output_format: "png",
-              user: userId,
-            },
-          },
+        // Step 1: Describe
+        const descriptionResponse = await withRetry(() => geminiClient!.models.generateContent({
+          model: 'gemini-flash-latest',
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: 'Describe this image in extreme detail. Focus on the main subjects, composition, lighting, and overall scene. Do not describe any style.' },
+                { inlineData: { data: imageBuffer.toString("base64"), mimeType: sourceMimeType as string } }
+              ]
+            }
+          ]
+        }));
+
+        const description = descriptionResponse.text;
+
+        // Step 2: Redraw
+        const combinedPrompt = `${description}\n\nStyle: ${prompt}`;
+
+        const hf = new HfInference(process.env.HF_TOKEN);
+        const hfBase64 = await withRetry(async () => {
+          try {
+            const res = (await hf.textToImage({
+              model,
+              inputs: combinedPrompt,
+            })) as unknown as Blob;
+            const arrayBuffer = await res.arrayBuffer();
+            return Buffer.from(arrayBuffer).toString("base64");
+          } catch (err: any) {
+            if (err?.httpResponse?.status === 503 || err?.status === 503) {
+              throw { status: 503 };
+            }
+            throw new Error(`Hugging Face API error: ${err.message || err}`);
+          }
         });
-
-        const u = out.usage;
-
-        if (u.inputTokens != null) {
-          span.setAttribute("gen_ai.usage.input_tokens", u.inputTokens);
-        }
-
-        if (u.outputTokens != null) {
-          span.setAttribute("gen_ai.usage.output_tokens", u.outputTokens);
-        }
-        if (u.totalTokens != null) {
-          span.setAttribute("gen_ai.usage.total_tokens", u.totalTokens);
-        }
 
         span.setAttribute(
           "gen_ai.response.text",
@@ -198,11 +207,11 @@ export async function POST(request: Request) {
           ]),
         );
 
-        return out;
+        return hfBase64;
       },
     );
 
-    const imageBase64 = result.image.base64;
+    const imageBase64 = result;
 
     const resultBuffer = Buffer.from(imageBase64, "base64");
 
@@ -239,22 +248,20 @@ export async function POST(request: Request) {
       model,
       savedGeneration,
     });
-  } catch (error) {
+  } catch (error: any) {
     console.error("generate-image route failed", error);
 
-    if (APICallError.isInstance(error)) {
+    if (error?.status === 503 || error?.error?.code === 503) {
       return NextResponse.json(
-        {
-          error: error.message || "Image generation failed. Please try again.",
-        },
-        { status: error.statusCode ?? 500 },
+        { error: "The AI model is currently busy or loading. Please try again in a few moments." },
+        { status: 503 },
       );
     }
 
-    if (NoImageGeneratedError.isInstance(error)) {
+    if (error?.status === 429 || error?.error?.code === 429) {
       return NextResponse.json(
-        { error: "The model did not return an image." },
-        { status: 502 },
+        { error: "AI rate limit exceeded. Please wait a moment and try again." },
+        { status: 429 },
       );
     }
 
